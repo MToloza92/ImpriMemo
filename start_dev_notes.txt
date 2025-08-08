@@ -1,0 +1,5 @@
+[ ] Detectar conexión BT al iniciar el vehículo
+[ ] Cargar mensajes desde messages/mensajes.json
+[ ] Enviar texto a impresora vía bluetooth.py
+[ ] Eliminar o marcar como impreso tras imprimir
+[ ] Agregar interfaz mínima o script de configuración

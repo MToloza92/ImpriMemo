@@ -1,0 +1,599 @@
+bluetooth .py
+
+import asyncio
+import struct
+from bleak import BleakScanner, BleakClient
+from bleak.exc import BleakError
+from PIL import Image, ImageDraw, ImageFont
+import textwrap
+import os
+import time
+import logging
+
+# Configurar logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("ImpriMemo")
+
+# Parámetros de la impresora
+PRINTER_NAME = "MX06"
+PRINTER_ADDRESS = "FF:06:25:13:2E:96"
+
+# UUIDs alternativos (comunes en impresoras térmicas)
+PRINTER_CHAR_UUIDS = [
+    "0000ae01-0000-1000-8000-00805f9b34fb",  # Cat Printer
+    "0000ae02-0000-1000-8000-00805f9b34fb",  # Alternativa común
+    "beb5483e-36e1-4688-b7f5-ea07361b26a8",  # Otro común
+    "0000ff02-0000-1000-8000-00805f9b34fb",  # Posible alternativa
+]
+
+# Tabla CRC-8
+CRC8_TABLE = [
+    0x00, 0x07, 0x0E, 0x09, 0x1C, 0x1B, 0x12, 0x15, 0x38, 0x3F, 0x36, 0x31, 0x24, 0x23, 0x2A, 0x2D,
+    0x70, 0x77, 0x7E, 0x79, 0x6C, 0x6B, 0x62, 0x65, 0x48, 0x4F, 0x46, 0x41, 0x54, 0x53, 0x5A, 0x5D,
+    0xE0, 0xE7, 0xEE, 0xE9, 0xFC, 0xFB, 0xF2, 0xF5, 0xD8, 0xDF, 0xD6, 0xD1, 0xC4, 0xC3, 0xCA, 0xCD,
+    0x90, 0x97, 0x9E, 0x99, 0x8C, 0x8B, 0x82, 0x85, 0xA8, 0xAF, 0xA6, 0xA1, 0xB4, 0xB3, 0xBA, 0xBD,
+    0xC7, 0xC0, 0xC9, 0xCE, 0xDB, 0xDC, 0xD5, 0xD2, 0xFF, 0xF8, 0xF1, 0xF6, 0xE3, 0xE4, 0xED, 0xEA,
+    0xB7, 0xB0, 0xB9, 0xBE, 0xAB, 0xAC, 0xA5, 0xA2, 0x8F, 0x88, 0x81, 0x86, 0x93, 0x94, 0x9D, 0x9A,
+    0x27, 0x20, 0x29, 0x2E, 0x3B, 0x3C, 0x35, 0x32, 0x1F, 0x18, 0x11, 0x16, 0x03, 0x04, 0x0D, 0x0A,
+    0x57, 0x50, 0x59, 0x5E, 0x4B, 0x4C, 0x45, 0x42, 0x6F, 0x68, 0x61, 0x66, 0x73, 0x74, 0x7D, 0x7A,
+    0x89, 0x8E, 0x87, 0x80, 0x95, 0x92, 0x9B, 0x9C, 0xB1, 0xB6, 0xBF, 0xB8, 0xAD, 0xAA, 0xA3, 0xA4,
+    0xF9, 0xFE, 0xF7, 0xF0, 0xE5, 0xE2, 0xEB, 0xEC, 0xC1, 0xC6, 0xCF, 0xC8, 0xDD, 0xDA, 0xD3, 0xD4,
+    0x69, 0x6E, 0x67, 0x60, 0x75, 0x72, 0x7B, 0x7C, 0x51, 0x56, 0x5F, 0x58, 0x4D, 0x4A, 0x43, 0x44,
+    0x19, 0x1E, 0x17, 0x10, 0x05, 0x02, 0x0B, 0x0C, 0x21, 0x26, 0x2F, 0x28, 0x3D, 0x3A, 0x33, 0x34,
+    0x4E, 0x49, 0x40, 0x47, 0x52, 0x55, 0x5C, 0x5B, 0x76, 0x71, 0x78, 0x7F, 0x6A, 0x6D, 0x64, 0x63,
+    0x3E, 0x39, 0x30, 0x37, 0x22, 0x25, 0x2C, 0x2B, 0x06, 0x01, 0x08, 0x0F, 0x1A, 0x1D, 0x14, 0x13,
+    0xAE, 0xA9, 0xA0, 0xA7, 0xB2, 0xB5, 0xBC, 0xBB, 0x96, 0x91, 0x98, 0x9F, 0x8A, 0x8D, 0x84, 0x83,
+    0xDE, 0xD9, 0xD0, 0xD7, 0xC2, 0xC5, 0xCC, 0xCB, 0xE6, 0xE1, 0xE8, 0xEF, 0xFA, 0xFD, 0xF4, 0xF3
+]
+
+def crc8(data: bytes) -> int:
+    crc = 0
+    for b in data:
+        crc = CRC8_TABLE[(crc ^ b) & 0xFF]
+    return crc
+
+def format_command(cmd_id: int, payload: bytes = b"") -> bytes:
+    header = bytes([0x51, 0x78, cmd_id, 0x00])
+    length = len(payload)
+    length_bytes = struct.pack("<H", length)
+    packet = header + length_bytes + payload
+    crc_val = crc8(packet[2:])
+    return packet + bytes([crc_val, 0xFF])
+
+# Comandos
+CMD_INIT = 0xA0
+CMD_PRINT = 0xA2
+CMD_FEED = 0xA1
+
+def get_font_path():
+    """Obtiene la ruta de la fuente con manejo de errores"""
+    try:
+        # Rutas alternativas comunes
+        paths = [
+            os.path.abspath("assets/fonts/DejaVuSans.ttf"),
+            os.path.abspath("fonts/DejaVuSans.ttf"),
+            os.path.join(os.path.dirname(__file__), "..", "assets", "fonts", "DejaVuSans.ttf")
+        ]
+        
+        for path in paths:
+            if os.path.exists(path):
+                return path
+                
+        logger.warning("No se encontró archivo de fuente. Usando fuente por defecto")
+        return None
+    except Exception as e:
+        logger.error(f"Error buscando fuente: {e}")
+        return None
+
+def render_text_to_image(text: str, width=384) -> Image.Image:
+    """Renderiza texto a imagen con manejo robusto de errores"""
+    try:
+        font_size = 24
+        font_path = get_font_path()
+        
+        if font_path:
+            font = ImageFont.truetype(font_path, font_size)
+            logger.info(f"Usando fuente: {font_path}")
+        else:
+            font = ImageFont.load_default()
+            logger.warning("Usando fuente por defecto (calidad baja)")
+        
+        line_spacing = 5
+        wrapped_lines = []
+        
+        # Manejar texto vacío
+        if not text.strip():
+            text = " "
+            
+        for line in text.split('\n'):
+            wrapped_lines.extend(textwrap.wrap(line, width=width//(font_size//2)))
+        
+        line_height = font_size + line_spacing
+        height = len(wrapped_lines) * line_height + 20
+        
+        img = Image.new("1", (width, height), 1)
+        draw = ImageDraw.Draw(img)
+        
+        y = 10
+        for line in wrapped_lines:
+            draw.text((10, y), line, font=font, fill=0)
+            y += line_height
+        
+        return img
+    except Exception as e:
+        logger.error(f"Error renderizando texto: {e}")
+        # Crear imagen de error
+        img = Image.new("1", (width, 100), 1)
+        draw = ImageDraw.Draw(img)
+        draw.text((10, 10), "Error al renderizar texto", fill=0)
+        return img
+
+def image_to_printer_data(image: Image.Image, threshold=128) -> bytes:
+    """Convierte imagen a datos de impresora con manejo de errores"""
+    try:
+        # Convertir a escala de grises
+        image = image.convert("L")
+        
+        # Crear tabla de umbral
+        threshold_table = [0 if i < threshold else 255 for i in range(256)]
+        image = image.point(threshold_table, '1')
+        
+        # Rotar imagen
+        image = image.rotate(90, expand=True)
+        
+        # Obtener dimensiones
+        width, height = image.size
+        bytes_per_row = (width + 7) // 8
+        
+        # Construir datos
+        data = bytearray()
+        for y in range(height):
+            for x in range(bytes_per_row):
+                byte = 0
+                for bit in range(8):
+                    px = x * 8 + bit
+                    if px < width:
+                        pixel = image.getpixel((px, y))
+                        pixel_value = 0 if pixel == 0 else 1
+                        if pixel_value == 0:
+                            byte |= 1 << (7 - bit)
+                data.append(byte)
+        
+        return bytes(data)
+    except Exception as e:
+        logger.error(f"Error convirtiendo imagen: {e}")
+        return b""
+
+async def send_command(client: BleakClient, char_uuid: str, cmd_id: int, payload: bytes = b""):
+    """Envía comando con manejo robusto de errores"""
+    try:
+        cmd = format_command(cmd_id, payload)
+        chunk_size = 128  # Tamaño reducido para evitar errores
+        
+        for i in range(0, len(cmd), chunk_size):
+            chunk = cmd[i:i+chunk_size]
+            await client.write_gatt_char(char_uuid, chunk, response=False)
+            await asyncio.sleep(0.01)
+            
+        return True
+    except Exception as e:
+        logger.error(f"Error enviando comando: {e}")
+        return False
+
+async def find_printer_characteristic(client: BleakClient):
+    """Busca la característica correcta para la impresora"""
+    for uuid in PRINTER_CHAR_UUIDS:
+        try:
+            # Verificar si la característica existe
+            await client.get_characteristic(uuid)
+            logger.info(f"Característica encontrada: {uuid}")
+            return uuid
+        except BleakError:
+            continue
+    
+    # Si no encontramos ninguna, intentar buscar en todas las características
+    try:
+        services = await client.get_services()
+        for service in services:
+            for char in service.characteristics:
+                if "write" in char.properties:
+                    logger.warning(f"Probando característica alternativa: {char.uuid}")
+                    try:
+                        # Prueba simple
+                        test_cmd = b"\x1B\x40"  # Comando de inicialización básico
+                        await client.write_gatt_char(char.uuid, test_cmd, response=False)
+                        logger.info(f"Característica funcional encontrada: {char.uuid}")
+                        return char.uuid
+                    except:
+                        continue
+    except Exception as e:
+        logger.error(f"Error buscando característica: {e}")
+    
+    return None
+
+async def connect_and_print(text: str):
+    """Función principal para conectar e imprimir con manejo robusto"""
+    logger.info(f"Iniciando impresión: '{text}'")
+    
+    # Buscar dispositivo
+    try:
+        device = await BleakScanner.find_device_by_address(PRINTER_ADDRESS, timeout=20.0)
+        if not device:
+            devices = await BleakScanner.discover(timeout=20.0)
+            device = next((d for d in devices if d.name and PRINTER_NAME in d.name), None)
+        
+        if not device:
+            logger.error("Impresora no encontrada")
+            return False
+        
+        logger.info(f"Conectando a {device.name or 'Dispositivo'} [{device.address}]")
+    except Exception as e:
+        logger.error(f"Error buscando dispositivo: {e}")
+        return False
+    
+    # Conectar
+    try:
+        async with BleakClient(device) as client:
+            if not client.is_connected:
+                logger.error("Conexión fallida")
+                return False
+            
+            # Buscar característica
+            char_uuid = await find_printer_characteristic(client)
+            if not char_uuid:
+                logger.error("No se encontró característica válida")
+                return False
+            
+            # Inicializar
+            if not await send_command(client, char_uuid, CMD_INIT, b'\x00\x00\x00'):
+                logger.error("Fallo en inicialización")
+                return False
+            
+            await asyncio.sleep(0.5)
+            
+            # Renderizar e imprimir
+            image = render_text_to_image(text)
+            bitmap_data = image_to_printer_data(image)
+            
+            if not bitmap_data:
+                logger.error("Datos de imagen vacíos")
+                return False
+            
+            if not await send_command(client, char_uuid, CMD_PRINT, bitmap_data):
+                logger.error("Fallo en impresión")
+                return False
+            
+            await asyncio.sleep(0.5)
+            
+            # Avanzar papel
+            if not await send_command(client, char_uuid, CMD_FEED, struct.pack("<H", 10)):
+                logger.error("Fallo al avanzar papel")
+                return False
+            
+            logger.info("Impresión exitosa")
+            return True
+    except Exception as e:
+        logger.error(f"Error de conexión: {e}")
+        return False
+
+async def conectar_y_enviar(texto: str):
+    return await connect_and_print(texto)
+
+# Prueba directa
+if __name__ == "__main__":
+    async def demo():
+        print("=== PRUEBA DE IMPRESIÓN ===")
+        result = await conectar_y_enviar("Prueba de ImpriMemo")
+        print(f"Resultado: {'Éxito' if result else 'Fallo'}")
+    
+    asyncio.run(demo())
+
+---------------------------------------------------
+
+printer.py 
+
+    from app.bluetooth import conectar_y_enviar
+import asyncio
+
+async def imprimir_lista_mensajes(mensajes):
+    """Print a list of messages sequentially"""
+    for mensaje in mensajes:
+        print(f" Enviando mensaje: {mensaje}")
+        try:
+            # Add a small delay between messages
+            await conectar_y_enviar(mensaje)
+            await asyncio.sleep(1)  # Wait between messages
+        except Exception as e:
+            print(f"Error al imprimir '{mensaje}': {e}")
+
+
+-------------------------------------------------------
+
+storage.py
+
+import json
+import os
+from pathlib import Path
+
+# Create messages directory if not exists
+MESSAGES_DIR = "messages"
+Path(MESSAGES_DIR).mkdir(exist_ok=True)
+
+ARCHIVO_MENSAJES = os.path.join(MESSAGES_DIR, "mensajes.json")
+
+def cargar_mensajes():
+    if not os.path.exists(ARCHIVO_MENSAJES):
+        return []
+    
+    with open(ARCHIVO_MENSAJES, "r", encoding="utf-8") as archivo:
+        try:
+            mensajes = json.load(archivo)
+            return mensajes if isinstance(mensajes, list) else []
+        except json.JSONDecodeError:
+            return []
+
+def borrar_mensajes():
+    with open(ARCHIVO_MENSAJES, "w", encoding="utf-8") as archivo:
+        json.dump([], archivo, indent=2, ensure_ascii=False)
+
+
+
+--------------------------------------------------------------------
+
+agregar_mensaje.py
+
+import json
+import os
+from pathlib import Path
+
+# Ensure messages directory exists
+MESSAGES_DIR = "messages"
+Path(MESSAGES_DIR).mkdir(exist_ok=True)
+
+ARCHIVO_MENSAJES = os.path.join(MESSAGES_DIR, "mensajes.json")
+
+def agregar_mensaje(nuevo_mensaje):
+    mensajes = []
+    if os.path.exists(ARCHIVO_MENSAJES):
+        with open(ARCHIVO_MENSAJES, "r", encoding="utf-8") as archivo:
+            try:
+                mensajes = json.load(archivo)
+                if not isinstance(mensajes, list):
+                    mensajes = []
+            except json.JSONDecodeError:
+                mensajes = []
+
+    mensajes.append(nuevo_mensaje)
+
+    with open(ARCHIVO_MENSAJES, "w", encoding="utf-8") as archivo:
+        json.dump(mensajes, archivo, indent=2, ensure_ascii=False)
+
+    print(f"Mensaje agregado: '{nuevo_mensaje}'")
+
+if __name__ == "__main__":
+    texto = input("Ingresa el mensaje a agregar: ")
+    agregar_mensaje(texto)
+
+
+
+----------------------------------------------------------------------
+
+explorar_dispositivos.py
+
+import asyncio
+from bleak import BleakScanner, BleakClient
+
+async def explorar_dispositivo(nombre_objetivo="MX06"):
+    print("Buscando dispositivos...")
+    dispositivos = await BleakScanner.discover()
+
+    dispositivo = next((d for d in dispositivos if d.name and nombre_objetivo.lower() in d.name.lower()), None)
+    if not dispositivo:
+        print("No se encontró el dispositivo.")
+        return
+
+    print(f"Conectando a {dispositivo.name}...")
+    async with BleakClient(dispositivo) as cliente:
+        print("Conectado.")
+        print("Servicios y características disponibles:")
+        for servicio in cliente.services:
+            print(f"Servicio: {servicio.uuid}")
+            for char in servicio.characteristics:
+                print(f"  └── Característica: {char.uuid} - propiedades: {char.properties}")
+
+asyncio.run(explorar_dispositivo("MX06"))
+
+
+# Servicios y características disponibles:
+# Servicio: 00001800-0000-1000-8000-00805f9b34fb
+#   └── Característica: 00002a00-0000-1000-8000-00805f9b34fb - propiedades: ['read', 'write']
+# Servicio: 0000ae30-0000-1000-8000-00805f9b34fb
+#   └── Característica: 0000ae01-0000-1000-8000-00805f9b34fb - propiedades: ['write-without-response']
+#   └── Característica: 0000ae02-0000-1000-8000-00805f9b34fb - propiedades: ['notify']
+#   └── Característica: 0000ae03-0000-1000-8000-00805f9b34fb - propiedades: ['write-without-response']
+#   └── Característica: 0000ae04-0000-1000-8000-00805f9b34fb - propiedades: ['notify']
+#   └── Característica: 0000ae05-0000-1000-8000-00805f9b34fb - propiedades: ['indicate']
+#   └── Característica: 0000ae10-0000-1000-8000-00805f9b34fb - propiedades: ['read', 'write']
+# Servicio: 0000ae3a-0000-1000-8000-00805f9b34fb
+#   └── Característica: 0000ae3b-0000-1000-8000-00805f9b34fb - propiedades: ['write-without-response']
+#   └── Característica: 0000ae3c-0000-1000-8000-00805f9b34fb - propiedades: ['notify']
+
+
+
+--------------------------------------------------
+
+scan_bt.py
+
+import asyncio
+from bleak import BleakScanner
+
+async def main():
+    print("🔍 Escaneando dispositivos Bluetooth...")
+    dispositivos = await BleakScanner.discover()
+    for d in dispositivos:
+        print(f"Nombre: {d.name} | Dirección: {d.address}")
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+# Nombre: MX06 | Dirección: FF:06:25:13:2E:96
+
+
+--------------------------------------------------------
+
+main.py
+
+import asyncio
+from app import storage, printer
+
+async def main():
+    """
+    Flujo principal:
+    - Cargar mensajes.
+    - Imprimirlos si existen.
+    - Borrarlos después de imprimir.
+    """
+    mensajes = storage.cargar_mensajes()
+
+    if mensajes:
+        await printer.imprimir_lista_mensajes(mensajes)
+        storage.borrar_mensajes()
+        print("Mensajes borrados después de imprimir.")
+    else:
+        print("No hay mensajes para imprimir.")
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+
+------------------------------------------------------------------
+
+readme.md
+
+# ImpriMemo 🧾🚗
+
+**ImpriMemo** es una aplicación que imprime automáticamente mensajes recordatorios en una impresora térmica Bluetooth al detectar que el celular se ha conectado al auto.
+
+## Funcionalidades
+- Detección automática de conexión Bluetooth.
+- Impresión directa de mensajes pendientes.
+- Almacenamiento local de mensajes en JSON.
+- Control manual y automático de impresión.
+
+## Estructura
+- `app/`: Código fuente principal.
+- `messages/`: Mensajes pendientes para imprimir.
+- `tests/`: Pruebas unitarias.
+- `assets/`: Recursos varios (logos, íconos, etc.)
+
+## Requisitos
+- Python 3.x
+- Biblioteca de Bluetooth (ej: `pybluez`, `bleak`)
+- Acceso a impresora térmica compatible
+
+## Cómo usar
+```bash
+python app/main.py
+
+---------------------------------------------------------------
+
+[ ] Detectar conexión BT al iniciar el vehículo
+[ ] Cargar mensajes desde messages/mensajes.json
+[ ] Enviar texto a impresora vía bluetooth.py
+[ ] Eliminar o marcar como impreso tras imprimir
+[ ] Agregar interfaz mínima o script de configuración
+
+
+
+
+-------------------------------------------------------------------
+
+
+
+
+PS C:\Users\mauri\Desktop\proyectos\ImpriMemo> & C:/Python313/python.exe c:/Users/mauri/Desktop/proyectos/ImpriMemo/tree.py
+./
+  .gitignore
+  code.txt
+  main.py
+  README.md
+  start_dev_notes.txt
+  tree.py
+  .git/
+    .probe-b7edd0c0-e914-4e2d-8c97-bbc3b828c9ed
+    COMMIT_EDITMSG
+    config
+    description
+    FETCH_HEAD
+    HEAD
+    index
+    hooks/
+      applypatch-msg.sample
+      commit-msg.sample
+      fsmonitor-watchman.sample
+      post-update.sample
+      pre-applypatch.sample
+      pre-commit.sample
+      pre-merge-commit.sample
+      pre-push.sample
+      pre-rebase.sample
+      pre-receive.sample
+      prepare-commit-msg.sample
+      push-to-checkout.sample
+      sendemail-validate.sample
+      update.sample
+    info/
+      exclude
+    logs/
+      HEAD
+      refs/
+        heads/
+          master
+        remotes/
+          origin/
+            HEAD
+            master
+    objects/
+      3a/
+        866c1c1d4101d4f741e84d324c5c558220adda
+      6a/
+        fac2fde94648422da8692b4b789dda676d6977
+      a8/
+        4dca7fcd2bed53164e0b843299d2ce0e51d76b
+      db/
+        6df26967cabc6ed44ce530165d4b3864b612f2
+      e6/
+        9de29bb2d1d6434b8b29ae775ad8c2e48c5391
+      fe/
+        6f5101e91fd9edc5acae7f72cf8b8e20591704
+      info/
+      pack/
+    refs/
+      heads/
+        master
+      remotes/
+        origin/
+          HEAD
+          master
+      tags/
+  app/
+    bluetooth.py
+    printer.py
+    storage.py
+    __init__.py
+    __pycache__/
+      bluetooth.cpython-311.pyc
+      bluetooth.cpython-313.pyc
+      printer.cpython-313.pyc
+      storage.cpython-313.pyc
+      __init__.cpython-313.pyc
+  assets/
+    fonts/
+      ARIAL.TTF
+      DejaVuSans.ttf
+  messages/
+    mensajes.json
+  scripts/
+    agregar_mensaje.py
+    explorar_dispositivo.py
+    scan_bt.py
