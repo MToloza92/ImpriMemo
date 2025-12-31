@@ -85,7 +85,7 @@ Una vez impresos, los mensajes se eliminan del archivo JSON.
 
 Clonar el repositorio:
 
-git clone https://github.com/tu-usuario/imprimemo.git
+https://github.com/MToloza92/ImpriMemo.git
 
 
 Ejecutar el flujo principal:
@@ -120,3 +120,4 @@ Integración con eventos del sistema (auto, WiFi, horarios)
 Mauricio Toloza
 Estudiante de Análisis y Programación
 Proyecto académico y experimental
+
